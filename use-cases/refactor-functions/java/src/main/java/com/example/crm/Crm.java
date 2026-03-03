@@ -11,67 +11,53 @@ public class Crm {
     private static final Logger logger = LogManager.getLogger(Crm.class);
     private final CustomerRepository customerRepository = new CustomerRepository();
 
+    /** Outcome of email field validation, used to drive the main processing loop. */
+    private enum EmailValidationStatus { VALID, INVALID, SKIP_DUPLICATE }
+
     /**
      * Processes raw customer data, validates it, transforms it, and loads it into the database.
-     * Handles different data sources, performs deduplication, and tracks processing errors.
+     * Delegates each distinct responsibility to a focused helper method.
      */
     public Map<String, Object> processCustomerData(List<Map<String, Object>> rawData,
                                                    String source,
                                                    CustomerProcessingOptions options) {
         long startTime = System.currentTimeMillis();
-        Map<String, Object> result = new HashMap<>();
-        List<Map<String, Object>> validRecords = new ArrayList<>();
-        List<Map<String, Object>> invalidRecords = new ArrayList<>();
-        List<Map<String, Object>> duplicateRecords = new ArrayList<>();
-        List<Map<String, Object>> processedRecords = new ArrayList<>();
-        Set<String> existingEmails = new HashSet<>();
-        Set<String> existingPhones = new HashSet<>();
-        Map<String, Integer> errorCounts = new HashMap<>();
-        int totalProcessed = 0;
-        int totalSuccess = 0;
-        int totalSkipped = 0;
-        int totalErrors = 0;
 
         if (rawData == null || rawData.isEmpty()) {
-            result.put("status", "error");
-            result.put("message", "No data provided for processing");
-            return result;
+            Map<String, Object> errorResult = new HashMap<>();
+            errorResult.put("status", "error");
+            errorResult.put("message", "No data provided for processing");
+            return errorResult;
         }
 
-        logger.info("Starting to process {} customer records from source: {}",
-                rawData.size(), source);
+        logger.info("Starting to process {} customer records from source: {}", rawData.size(), source);
 
-        // Load existing records for deduplication if needed
+        // --- 1. Deduplication setup ---
+        Set<String> existingEmails = new HashSet<>();
+        Set<String> existingPhones = new HashSet<>();
         if (options.isPerformDeduplication()) {
             try {
-                // Query existing customers for deduplication
-                List<Customer> existingCustomers = customerRepository.findAll();
-                for (Customer customer : existingCustomers) {
-                    if (customer.getEmail() != null && !customer.getEmail().isEmpty()) {
-                        existingEmails.add(customer.getEmail().toLowerCase());
-                    }
-                    if (customer.getPhoneNumber() != null && !customer.getPhoneNumber().isEmpty()) {
-                        existingPhones.add(normalizePhoneNumber(customer.getPhoneNumber()));
-                    }
-                }
-                logger.info("Loaded {} existing customers for deduplication", existingCustomers.size());
+                loadDeduplicationData(existingEmails, existingPhones);
             } catch (Exception e) {
                 logger.error("Error loading existing customers for deduplication: {}", e.getMessage());
-                result.put("status", "error");
-                result.put("message", "Failed to load existing customers for deduplication");
-                result.put("error", e.getMessage());
-                return result;
+                Map<String, Object> errorResult = new HashMap<>();
+                errorResult.put("status", "error");
+                errorResult.put("message", "Failed to load existing customers for deduplication");
+                errorResult.put("error", e.getMessage());
+                return errorResult;
             }
         }
 
-        // Process each record
+        // --- 2. Per-record processing loop ---
+        List<Map<String, Object>> validRecords = new ArrayList<>();
+        List<Map<String, Object>> invalidRecords = new ArrayList<>();
+        List<Map<String, Object>> duplicateRecords = new ArrayList<>();
+        Map<String, Integer> errorCounts = new HashMap<>();
+        int totalProcessed = 0, totalSuccess = 0, totalSkipped = 0, totalErrors = 0;
+
         for (Map<String, Object> record : rawData) {
             totalProcessed++;
-            Map<String, Object> processedRecord = new HashMap<>(record);
-            List<String> recordErrors = new ArrayList<>();
-            boolean isValid = true;
 
-            // Skip processing if max error threshold has been reached
             if (options.getMaxErrorCount() > 0 && totalErrors >= options.getMaxErrorCount()) {
                 logger.warn("Maximum error threshold reached ({}). Skipping remaining records.",
                         options.getMaxErrorCount());
@@ -79,262 +65,35 @@ public class Crm {
                 break;
             }
 
+            Map<String, Object> processedRecord = new HashMap<>(record);
             try {
-                // Source-specific preprocessing
-                if (source.equals("csv")) {
-                    // Handle CSV-specific formatting
-                    processedRecord = preprocessCsvRecord(processedRecord);
-                } else if (source.equals("api")) {
-                    // Handle API-specific formatting
-                    processedRecord = preprocessApiRecord(processedRecord);
-                } else if (source.equals("manual")) {
-                    // Handle manually entered data formatting
-                    processedRecord = preprocessManualRecord(processedRecord);
+                processedRecord = preprocessRecord(processedRecord, source);
+                List<String> recordErrors = new ArrayList<>();
+
+                EmailValidationStatus emailStatus = validateAndProcessEmail(
+                        processedRecord, recordErrors, validRecords, existingEmails, options);
+
+                if (emailStatus == EmailValidationStatus.SKIP_DUPLICATE) {
+                    duplicateRecords.add(processedRecord);
+                    totalSkipped++;
+                    continue;
                 }
 
-                // Validate required fields
-                if (!processedRecord.containsKey("email") ||
-                        processedRecord.get("email") == null ||
-                        processedRecord.get("email").toString().trim().isEmpty()) {
-                    recordErrors.add("Missing required field: email");
-                    isValid = false;
-                } else {
-                    String email = processedRecord.get("email").toString().trim().toLowerCase();
-                    processedRecord.put("email", email);
+                boolean isValid = (emailStatus == EmailValidationStatus.VALID);
+                isValid &= validateAndProcessName(processedRecord, recordErrors, "firstName");
+                isValid &= validateAndProcessName(processedRecord, recordErrors, "lastName");
+                isValid &= validateAndProcessPhone(processedRecord, recordErrors, validRecords, existingPhones, options);
+                isValid &= validateAndProcessAddress(processedRecord, recordErrors);
+                isValid &= validateAndProcessDateOfBirth(processedRecord, recordErrors);
+                isValid &= applyCustomValidation(processedRecord, recordErrors, options);
 
-                    // Validate email format
-                    if (!isValidEmail(email)) {
-                        recordErrors.add("Invalid email format: " + email);
-                        isValid = false;
-                    }
-
-                    // Check for duplicates in current batch
-                    if (options.isPerformDeduplication()) {
-                        boolean isDuplicate = false;
-                        for (Map<String, Object> validRecord : validRecords) {
-                            if (email.equals(validRecord.get("email").toString().toLowerCase())) {
-                                isDuplicate = true;
-                                break;
-                            }
-                        }
-
-                        // Check against existing records in database
-                        if (!isDuplicate && existingEmails.contains(email)) {
-                            isDuplicate = true;
-                        }
-
-                        if (isDuplicate) {
-                            recordErrors.add("Duplicate email: " + email);
-                            if (options.isDuplicatesAreErrors()) {
-                                isValid = false;
-                            } else {
-                                duplicateRecords.add(processedRecord);
-                                totalSkipped++;
-                                continue;
-                            }
-                        }
-                    }
-                }
-
-                // Validate and process name fields
-                if (processedRecord.containsKey("firstName") && processedRecord.get("firstName") != null) {
-                    String firstName = processedRecord.get("firstName").toString().trim();
-                    // Capitalize first letter
-                    if (!firstName.isEmpty()) {
-                        firstName = firstName.substring(0, 1).toUpperCase() +
-                                (firstName.length() > 1 ? firstName.substring(1) : "");
-                    }
-                    processedRecord.put("firstName", firstName);
-                } else {
-                    // First name is required
-                    recordErrors.add("Missing required field: firstName");
-                    isValid = false;
-                }
-
-                if (processedRecord.containsKey("lastName") && processedRecord.get("lastName") != null) {
-                    String lastName = processedRecord.get("lastName").toString().trim();
-                    // Capitalize first letter
-                    if (!lastName.isEmpty()) {
-                        lastName = lastName.substring(0, 1).toUpperCase() +
-                                (lastName.length() > 1 ? lastName.substring(1) : "");
-                    }
-                    processedRecord.put("lastName", lastName);
-                } else {
-                    // Last name is required
-                    recordErrors.add("Missing required field: lastName");
-                    isValid = false;
-                }
-
-                // Process and validate phone number if present
-                if (processedRecord.containsKey("phone") &&
-                        processedRecord.get("phone") != null &&
-                        !processedRecord.get("phone").toString().trim().isEmpty()) {
-
-                    String phone = processedRecord.get("phone").toString().trim();
-                    String normalizedPhone = normalizePhoneNumber(phone);
-
-                    if (!isValidPhoneNumber(normalizedPhone)) {
-                        recordErrors.add("Invalid phone number format: " + phone);
-                        isValid = false;
-                    } else {
-                        processedRecord.put("phone", formatPhoneNumber(normalizedPhone));
-
-                        // Check for duplicate phone numbers if deduplication is enabled
-                        if (options.isPerformDeduplication()) {
-                            boolean isDuplicate = false;
-                            for (Map<String, Object> validRecord : validRecords) {
-                                if (validRecord.containsKey("phone") &&
-                                        normalizedPhone.equals(
-                                                normalizePhoneNumber(validRecord.get("phone").toString()))) {
-                                    isDuplicate = true;
-                                    break;
-                                }
-                            }
-
-                            // Check against existing records in database
-                            if (!isDuplicate && existingPhones.contains(normalizedPhone)) {
-                                isDuplicate = true;
-                            }
-
-                            if (isDuplicate) {
-                                recordErrors.add("Duplicate phone number: " + phone);
-                                if (options.isDuplicatesAreErrors()) {
-                                    isValid = false;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Process address fields if present
-                if (processedRecord.containsKey("address") &&
-                        processedRecord.get("address") != null) {
-
-                    Map<String, Object> addressData;
-
-                    // Handle different address formats
-                    if (processedRecord.get("address") instanceof Map) {
-                        addressData = (Map<String, Object>) processedRecord.get("address");
-                    } else if (processedRecord.get("address") instanceof String) {
-                        // Parse address string into components
-                        addressData = parseAddressString(processedRecord.get("address").toString());
-                    } else {
-                        recordErrors.add("Invalid address format");
-                        isValid = false;
-                        addressData = new HashMap<>();
-                    }
-
-                    // Validate and normalize address components
-                    Map<String, Object> normalizedAddress = new HashMap<>();
-
-                    if (addressData.containsKey("street") && addressData.get("street") != null) {
-                        normalizedAddress.put("street", addressData.get("street").toString().trim());
-                    }
-
-                    if (addressData.containsKey("city") && addressData.get("city") != null) {
-                        String city = addressData.get("city").toString().trim();
-                        // Capitalize each word in city name
-                        normalizedAddress.put("city", capitalizeWords(city));
-                    }
-
-                    if (addressData.containsKey("state") && addressData.get("state") != null) {
-                        String state = addressData.get("state").toString().trim().toUpperCase();
-
-                        // Validate state/province code for US and Canada
-                        if (addressData.containsKey("country") &&
-                                (addressData.get("country").toString().equals("US") ||
-                                        addressData.get("country").toString().equals("CA"))) {
-
-                            if (!isValidStateOrProvince(state, addressData.get("country").toString())) {
-                                recordErrors.add("Invalid state/province: " + state);
-                                isValid = false;
-                            }
-                        }
-
-                        normalizedAddress.put("state", state);
-                    }
-
-                    if (addressData.containsKey("zip") && addressData.get("zip") != null) {
-                        String zip = addressData.get("zip").toString().trim();
-                        normalizedAddress.put("zip", zip);
-
-                        // Validate postal code format if country is provided
-                        if (addressData.containsKey("country")) {
-                            String country = addressData.get("country").toString();
-                            if (!isValidPostalCode(zip, country)) {
-                                recordErrors.add("Invalid postal code format for " + country + ": " + zip);
-                                isValid = false;
-                            }
-                        }
-                    }
-
-                    if (addressData.containsKey("country") && addressData.get("country") != null) {
-                        String country = addressData.get("country").toString().trim();
-
-                        // Convert country codes to full names if needed
-                        if (country.length() <= 3) {
-                            String fullCountryName = getCountryNameFromCode(country);
-                            if (fullCountryName != null) {
-                                country = fullCountryName;
-                            } else {
-                                recordErrors.add("Invalid country code: " + country);
-                                isValid = false;
-                            }
-                        }
-
-                        normalizedAddress.put("country", country);
-                    }
-
-                    processedRecord.put("address", normalizedAddress);
-                }
-
-                // Process date fields
-                if (processedRecord.containsKey("dateOfBirth") &&
-                        processedRecord.get("dateOfBirth") != null &&
-                        !processedRecord.get("dateOfBirth").toString().trim().isEmpty()) {
-
-                    String dobString = processedRecord.get("dateOfBirth").toString().trim();
-                    try {
-                        Date dob = parseDate(dobString);
-                        // Validate age range
-                        Calendar cal = Calendar.getInstance();
-                        cal.setTime(dob);
-                        int birthYear = cal.get(Calendar.YEAR);
-                        int currentYear = Calendar.getInstance().get(Calendar.YEAR);
-
-                        if (currentYear - birthYear > 120 || currentYear - birthYear < 18) {
-                            recordErrors.add("Invalid date of birth (age must be between 18 and 120): " + dobString);
-                            isValid = false;
-                        } else {
-                            // Format date consistently
-                            processedRecord.put("dateOfBirth", formatDate(dob));
-                        }
-                    } catch (ParseException e) {
-                        recordErrors.add("Invalid date format for date of birth: " + dobString);
-                        isValid = false;
-                    }
-                }
-
-                // Custom validation if provided
-                if (options.getCustomValidator() != null) {
-                    List<String> customErrors = options.getCustomValidator().validate(processedRecord);
-                    if (customErrors != null && !customErrors.isEmpty()) {
-                        recordErrors.addAll(customErrors);
-                        isValid = false;
-                    }
-                }
-
-                // Final decision on record validity
                 if (isValid) {
                     validRecords.add(processedRecord);
                     totalSuccess++;
                 } else {
-                    // Add errors to record
                     processedRecord.put("errors", recordErrors);
                     invalidRecords.add(processedRecord);
                     totalErrors++;
-
-                    // Track error types
                     for (String error : recordErrors) {
                         String errorType = error.split(":")[0].trim();
                         errorCounts.put(errorType, errorCounts.getOrDefault(errorType, 0) + 1);
@@ -344,82 +103,361 @@ public class Crm {
             } catch (Exception e) {
                 logger.error("Unexpected error processing record {}: {}", totalProcessed, e.getMessage());
                 e.printStackTrace();
-
-                // Add to invalid records with error info
                 processedRecord.put("errors", Collections.singletonList("Processing error: " + e.getMessage()));
                 invalidRecords.add(processedRecord);
                 totalErrors++;
-
-                // Track error
-                String errorType = "Processing error";
-                errorCounts.put(errorType, errorCounts.getOrDefault(errorType, 0) + 1);
+                errorCounts.put("Processing error", errorCounts.getOrDefault("Processing error", 0) + 1);
             }
         }
 
-        // Save valid records to database if requested
+        // --- 3. Persist valid records ---
         if (options.isSaveToDatabase() && !validRecords.isEmpty()) {
             try {
-                List<Customer> customers = new ArrayList<>();
-                for (Map<String, Object> record : validRecords) {
-                    Customer customer = mapToCustomerEntity(record);
-                    customer.setDataSource(source);
-                    customer.setCreatedAt(new Date());
-                    customers.add(customer);
-                }
-
-                customerRepository.saveAll(customers);
-                logger.info("Successfully saved {} customer records to database", customers.size());
-
-                // Mark records as processed
-                processedRecords.addAll(validRecords);
-
+                persistValidRecords(validRecords, source);
+                logger.info("Successfully saved {} customer records to database", validRecords.size());
             } catch (Exception e) {
                 logger.error("Error saving records to database: {}", e.getMessage());
-                result.put("status", "error");
-                result.put("message", "Failed to save valid records to database");
-                result.put("error", e.getMessage());
-                return result;
+                Map<String, Object> errorResult = new HashMap<>();
+                errorResult.put("status", "error");
+                errorResult.put("message", "Failed to save valid records to database");
+                errorResult.put("error", e.getMessage());
+                return errorResult;
             }
-        } else {
-            // Just mark as processed without saving
-            processedRecords.addAll(validRecords);
         }
 
-        // Generate processing report
-        long endTime = System.currentTimeMillis();
-        long processingTime = endTime - startTime;
+        // --- 4. Build and return the processing report ---
+        long processingTime = System.currentTimeMillis() - startTime;
+        logger.info("Customer data processing completed. Total: {}, Success: {}, Error: {}, Skipped: {}, Time: {} ms",
+                rawData.size(), totalSuccess, totalErrors, totalSkipped, processingTime);
 
+        return buildProcessingReport(source, rawData.size(), totalProcessed, totalSuccess, totalErrors,
+                totalSkipped, duplicateRecords, errorCounts, processingTime, validRecords, invalidRecords, options);
+    }
+
+    // -------------------------------------------------------------------------
+    // Extracted helper methods — each handles one distinct responsibility
+    // -------------------------------------------------------------------------
+
+    /**
+     * Populates the given sets with emails and phone numbers already stored in the repository,
+     * so that incoming records can be checked for duplicates.
+     */
+    private void loadDeduplicationData(Set<String> existingEmails, Set<String> existingPhones) {
+        List<Customer> existingCustomers = customerRepository.findAll();
+        for (Customer customer : existingCustomers) {
+            if (customer.getEmail() != null && !customer.getEmail().isEmpty()) {
+                existingEmails.add(customer.getEmail().toLowerCase());
+            }
+            if (customer.getPhoneNumber() != null && !customer.getPhoneNumber().isEmpty()) {
+                existingPhones.add(normalizePhoneNumber(customer.getPhoneNumber()));
+            }
+        }
+        logger.info("Loaded {} existing customers for deduplication", existingCustomers.size());
+    }
+
+    /**
+     * Routes a raw record through the appropriate source-specific pre-processor
+     * (CSV, API, or manual entry) before field-level validation begins.
+     */
+    private Map<String, Object> preprocessRecord(Map<String, Object> record, String source) {
+        switch (source) {
+            case "csv":    return preprocessCsvRecord(record);
+            case "api":    return preprocessApiRecord(record);
+            case "manual": return preprocessManualRecord(record);
+            default:       return record;
+        }
+    }
+
+    /**
+     * Validates the email field: checks presence, format, and (optionally) uniqueness.
+     * Returns SKIP_DUPLICATE when the record should be silently skipped rather than flagged.
+     */
+    private EmailValidationStatus validateAndProcessEmail(Map<String, Object> record,
+                                                          List<String> errors,
+                                                          List<Map<String, Object>> validRecords,
+                                                          Set<String> existingEmails,
+                                                          CustomerProcessingOptions options) {
+        if (!record.containsKey("email") || record.get("email") == null
+                || record.get("email").toString().trim().isEmpty()) {
+            errors.add("Missing required field: email");
+            return EmailValidationStatus.INVALID;
+        }
+
+        String email = record.get("email").toString().trim().toLowerCase();
+        record.put("email", email);
+
+        if (!isValidEmail(email)) {
+            errors.add("Invalid email format: " + email);
+            return EmailValidationStatus.INVALID;
+        }
+
+        if (options.isPerformDeduplication() && isEmailDuplicate(email, validRecords, existingEmails)) {
+            errors.add("Duplicate email: " + email);
+            return options.isDuplicatesAreErrors()
+                    ? EmailValidationStatus.INVALID
+                    : EmailValidationStatus.SKIP_DUPLICATE;
+        }
+
+        return EmailValidationStatus.VALID;
+    }
+
+    /** Returns true if the email already appears in the current batch or the existing-emails set. */
+    private boolean isEmailDuplicate(String email,
+                                     List<Map<String, Object>> validRecords,
+                                     Set<String> existingEmails) {
+        for (Map<String, Object> validRecord : validRecords) {
+            if (email.equals(validRecord.get("email").toString().toLowerCase())) {
+                return true;
+            }
+        }
+        return existingEmails.contains(email);
+    }
+
+    /**
+     * Validates and capitalises the first letter of a required name field (firstName or lastName).
+     * Appends an error and returns false when the field is absent or null.
+     */
+    private boolean validateAndProcessName(Map<String, Object> record,
+                                           List<String> errors,
+                                           String fieldName) {
+        if (!record.containsKey(fieldName) || record.get(fieldName) == null) {
+            errors.add("Missing required field: " + fieldName);
+            return false;
+        }
+        String name = record.get(fieldName).toString().trim();
+        if (!name.isEmpty()) {
+            name = name.substring(0, 1).toUpperCase() + (name.length() > 1 ? name.substring(1) : "");
+        }
+        record.put(fieldName, name);
+        return true;
+    }
+
+    /**
+     * Validates, normalises, and formats the optional phone field.
+     * Also performs duplicate detection when deduplication is enabled.
+     */
+    private boolean validateAndProcessPhone(Map<String, Object> record,
+                                            List<String> errors,
+                                            List<Map<String, Object>> validRecords,
+                                            Set<String> existingPhones,
+                                            CustomerProcessingOptions options) {
+        if (!record.containsKey("phone") || record.get("phone") == null
+                || record.get("phone").toString().trim().isEmpty()) {
+            return true; // phone is optional
+        }
+
+        String phone = record.get("phone").toString().trim();
+        String normalizedPhone = normalizePhoneNumber(phone);
+
+        if (!isValidPhoneNumber(normalizedPhone)) {
+            errors.add("Invalid phone number format: " + phone);
+            return false;
+        }
+
+        record.put("phone", formatPhoneNumber(normalizedPhone));
+
+        if (options.isPerformDeduplication()
+                && isPhoneDuplicate(normalizedPhone, validRecords, existingPhones)) {
+            errors.add("Duplicate phone number: " + phone);
+            if (options.isDuplicatesAreErrors()) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /** Returns true if the normalised phone already appears in the current batch or existing set. */
+    private boolean isPhoneDuplicate(String normalizedPhone,
+                                     List<Map<String, Object>> validRecords,
+                                     Set<String> existingPhones) {
+        for (Map<String, Object> validRecord : validRecords) {
+            if (validRecord.containsKey("phone")
+                    && normalizedPhone.equals(normalizePhoneNumber(validRecord.get("phone").toString()))) {
+                return true;
+            }
+        }
+        return existingPhones.contains(normalizedPhone);
+    }
+
+    /**
+     * Parses and normalises the optional address field.
+     * Accepts either a Map or a flat String and validates state/zip/country when present.
+     */
+    @SuppressWarnings("unchecked")
+    private boolean validateAndProcessAddress(Map<String, Object> record, List<String> errors) {
+        if (!record.containsKey("address") || record.get("address") == null) {
+            return true; // address is optional
+        }
+
+        Map<String, Object> addressData;
+        if (record.get("address") instanceof Map) {
+            addressData = (Map<String, Object>) record.get("address");
+        } else if (record.get("address") instanceof String) {
+            addressData = parseAddressString(record.get("address").toString());
+        } else {
+            errors.add("Invalid address format");
+            return false;
+        }
+
+        boolean isValid = true;
+        Map<String, Object> normalizedAddress = new HashMap<>();
+
+        if (addressData.containsKey("street") && addressData.get("street") != null) {
+            normalizedAddress.put("street", addressData.get("street").toString().trim());
+        }
+
+        if (addressData.containsKey("city") && addressData.get("city") != null) {
+            normalizedAddress.put("city", capitalizeWords(addressData.get("city").toString().trim()));
+        }
+
+        if (addressData.containsKey("state") && addressData.get("state") != null) {
+            String state = addressData.get("state").toString().trim().toUpperCase();
+            if (addressData.containsKey("country")) {
+                String country = addressData.get("country").toString();
+                if ((country.equals("US") || country.equals("CA"))
+                        && !isValidStateOrProvince(state, country)) {
+                    errors.add("Invalid state/province: " + state);
+                    isValid = false;
+                }
+            }
+            normalizedAddress.put("state", state);
+        }
+
+        if (addressData.containsKey("zip") && addressData.get("zip") != null) {
+            String zip = addressData.get("zip").toString().trim();
+            normalizedAddress.put("zip", zip);
+            if (addressData.containsKey("country")) {
+                String country = addressData.get("country").toString();
+                if (!isValidPostalCode(zip, country)) {
+                    errors.add("Invalid postal code format for " + country + ": " + zip);
+                    isValid = false;
+                }
+            }
+        }
+
+        if (addressData.containsKey("country") && addressData.get("country") != null) {
+            String country = addressData.get("country").toString().trim();
+            if (country.length() <= 3) {
+                String fullName = getCountryNameFromCode(country);
+                if (fullName != null) {
+                    country = fullName;
+                } else {
+                    errors.add("Invalid country code: " + country);
+                    isValid = false;
+                }
+            }
+            normalizedAddress.put("country", country);
+        }
+
+        record.put("address", normalizedAddress);
+        return isValid;
+    }
+
+    /**
+     * Parses the optional dateOfBirth field, validates the age is between 18 and 120,
+     * and re-formats it as yyyy-MM-dd.
+     */
+    private boolean validateAndProcessDateOfBirth(Map<String, Object> record, List<String> errors) {
+        if (!record.containsKey("dateOfBirth") || record.get("dateOfBirth") == null
+                || record.get("dateOfBirth").toString().trim().isEmpty()) {
+            return true; // dateOfBirth is optional
+        }
+
+        String dobString = record.get("dateOfBirth").toString().trim();
+        try {
+            Date dob = parseDate(dobString);
+            int birthYear = Calendar.getInstance(/* reuse */ ).get(Calendar.YEAR);
+            Calendar cal = Calendar.getInstance();
+            cal.setTime(dob);
+            birthYear = cal.get(Calendar.YEAR);
+            int currentYear = Calendar.getInstance().get(Calendar.YEAR);
+
+            if (currentYear - birthYear > 120 || currentYear - birthYear < 18) {
+                errors.add("Invalid date of birth (age must be between 18 and 120): " + dobString);
+                return false;
+            }
+            record.put("dateOfBirth", formatDate(dob));
+            return true;
+        } catch (ParseException e) {
+            errors.add("Invalid date format for date of birth: " + dobString);
+            return false;
+        }
+    }
+
+    /**
+     * Delegates record-level validation to the configured custom validator (if any).
+     * Returns false and appends errors when the validator finds problems.
+     */
+    private boolean applyCustomValidation(Map<String, Object> record,
+                                          List<String> errors,
+                                          CustomerProcessingOptions options) {
+        if (options.getCustomValidator() == null) {
+            return true;
+        }
+        List<String> customErrors = options.getCustomValidator().validate(record);
+        if (customErrors != null && !customErrors.isEmpty()) {
+            errors.addAll(customErrors);
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Converts valid records to Customer entities and saves them to the repository.
+     * Stamps each entity with its data source and creation timestamp.
+     */
+    private void persistValidRecords(List<Map<String, Object>> validRecords, String source) {
+        List<Customer> customers = new ArrayList<>();
+        for (Map<String, Object> record : validRecords) {
+            Customer customer = mapToCustomerEntity(record);
+            customer.setDataSource(source);
+            customer.setCreatedAt(new Date());
+            customers.add(customer);
+        }
+        customerRepository.saveAll(customers);
+    }
+
+    /**
+     * Assembles the final result map from processing counters and record lists.
+     * Optionally includes the valid, invalid, and duplicate record lists in the response.
+     */
+    private Map<String, Object> buildProcessingReport(String source,
+                                                       int totalRecords,
+                                                       int totalProcessed,
+                                                       int totalSuccess,
+                                                       int totalErrors,
+                                                       int totalSkipped,
+                                                       List<Map<String, Object>> duplicateRecords,
+                                                       Map<String, Integer> errorCounts,
+                                                       long processingTimeMs,
+                                                       List<Map<String, Object>> validRecords,
+                                                       List<Map<String, Object>> invalidRecords,
+                                                       CustomerProcessingOptions options) {
+        Map<String, Object> result = new HashMap<>();
         result.put("status", "success");
         result.put("source", source);
-        result.put("totalRecords", rawData.size());
+        result.put("totalRecords", totalRecords);
         result.put("processedCount", totalProcessed);
         result.put("successCount", totalSuccess);
         result.put("errorCount", totalErrors);
         result.put("skippedCount", totalSkipped);
         result.put("duplicateCount", duplicateRecords.size());
-        result.put("processingTimeMs", processingTime);
+        result.put("processingTimeMs", processingTimeMs);
         result.put("errorsByType", errorCounts);
 
         if (options.isIncludeRecordsInResponse()) {
-            if (options.isIncludeValidRecords()) {
-                result.put("validRecords", validRecords);
-            }
-            if (options.isIncludeInvalidRecords()) {
-                result.put("invalidRecords", invalidRecords);
-            }
-            if (options.isIncludeDuplicateRecords()) {
-                result.put("duplicateRecords", duplicateRecords);
-            }
+            if (options.isIncludeValidRecords())     result.put("validRecords", validRecords);
+            if (options.isIncludeInvalidRecords())   result.put("invalidRecords", invalidRecords);
+            if (options.isIncludeDuplicateRecords()) result.put("duplicateRecords", duplicateRecords);
         }
-
-        // Log completion
-        logger.info("Customer data processing completed. Total: {}, Success: {}, Error: {}, Skipped: {}, Time: {} ms",
-                rawData.size(), totalSuccess, totalErrors, totalSkipped, processingTime);
-
         return result;
     }
 
-    // Helper methods (not fully implemented)
+    // -------------------------------------------------------------------------
+    // Low-level utility stubs (source pre-processors, format helpers, etc.)
+    // -------------------------------------------------------------------------
+
     private Map<String, Object> preprocessCsvRecord(Map<String, Object> record) {
 // Handle CSV-specific preprocessing
         return record;
