@@ -3,8 +3,9 @@ build/
 !gradle/wrapper/gradle-wrapper.jar
 !**/src/main/**/build/
 !**/src/test/**/build/
-processed_images/
+# Generated image folders (source copies & all processed output dirs)
 sample_images/
+processed*/
 
 ### IntelliJ IDEA ###
 .idea/modules.xml
