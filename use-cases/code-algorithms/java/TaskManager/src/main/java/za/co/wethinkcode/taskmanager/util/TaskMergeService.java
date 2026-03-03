@@ -4,6 +4,8 @@ import za.co.wethinkcode.taskmanager.model.Task;
 import za.co.wethinkcode.taskmanager.model.TaskStatus;
 
 import java.util.*;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 public class TaskMergeService {
 
@@ -21,10 +23,10 @@ public class TaskMergeService {
         Map<String, Task> toCreateLocal = new HashMap<>();
         Map<String, Task> toUpdateLocal = new HashMap<>();
 
-        // Step 1: Identify all unique task IDs across both sources
-        Set<String> allTaskIds = new HashSet<>();
-        allTaskIds.addAll(localTasks.keySet());
-        allTaskIds.addAll(remoteTasks.keySet());
+        // Step 1: Collect every unique task ID from both sources in one pass
+        Set<String> allTaskIds = Stream
+                .concat(localTasks.keySet().stream(), remoteTasks.keySet().stream())
+                .collect(Collectors.toSet());
 
         for (String taskId : allTaskIds) {
             Task localTask = localTasks.get(taskId);

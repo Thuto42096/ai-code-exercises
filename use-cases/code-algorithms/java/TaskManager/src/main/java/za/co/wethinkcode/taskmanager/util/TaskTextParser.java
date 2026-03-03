@@ -8,13 +8,37 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 public class TaskTextParser {
+
+    // Compiled once at class-load time; reused for every parse call.
+    private static final Pattern PRIORITY_PATTERN = Pattern.compile(
+        "\\s!([1-4]|urgent|high|medium|low)\\b", Pattern.CASE_INSENSITIVE
+    );
+    private static final Pattern TAG_PATTERN  = Pattern.compile("\\s@(\\w+)");
+    private static final Pattern DATE_PATTERN = Pattern.compile("\\s#(\\w+)");
+
+    /** Maps every accepted day name / abbreviation to its ISO day-of-week value. */
+    private static final Map<String, Integer> DAY_MAP = Map.ofEntries(
+        Map.entry("monday",    DayOfWeek.MONDAY.getValue()),
+        Map.entry("mon",       DayOfWeek.MONDAY.getValue()),
+        Map.entry("tuesday",   DayOfWeek.TUESDAY.getValue()),
+        Map.entry("tue",       DayOfWeek.TUESDAY.getValue()),
+        Map.entry("wednesday", DayOfWeek.WEDNESDAY.getValue()),
+        Map.entry("wed",       DayOfWeek.WEDNESDAY.getValue()),
+        Map.entry("thursday",  DayOfWeek.THURSDAY.getValue()),
+        Map.entry("thu",       DayOfWeek.THURSDAY.getValue()),
+        Map.entry("friday",    DayOfWeek.FRIDAY.getValue()),
+        Map.entry("fri",       DayOfWeek.FRIDAY.getValue()),
+        Map.entry("saturday",  DayOfWeek.SATURDAY.getValue()),
+        Map.entry("sat",       DayOfWeek.SATURDAY.getValue()),
+        Map.entry("sunday",    DayOfWeek.SUNDAY.getValue()),
+        Map.entry("sun",       DayOfWeek.SUNDAY.getValue())
+    );
 
     /**
      * Parse free-form text to extract task properties.
@@ -38,19 +62,12 @@ public class TaskTextParser {
         List<String> tags = new ArrayList<>();
 
         // Extract priority markers (!N or !name)
-        Pattern priorityPattern = Pattern.compile(
-            "\\s!([1-4]|urgent|high|medium|low)\\b",
-            Pattern.CASE_INSENSITIVE
-        );
-        Matcher priorityMatcher = priorityPattern.matcher(title);
+        Matcher priorityMatcher = PRIORITY_PATTERN.matcher(title);
 
         if (priorityMatcher.find()) {
             String priorityText = priorityMatcher.group(1).toLowerCase();
-            // Remove from title
-            title = title.replaceAll(
-                "\\s!([1-4]|urgent|high|medium|low)\\b",
-                ""
-            );
+            // Remove from title (use the same compiled pattern)
+            title = PRIORITY_PATTERN.matcher(title).replaceAll("");
 
             // Convert to TaskPriority
             switch (priorityText) {
@@ -74,27 +91,23 @@ public class TaskTextParser {
         }
 
         // Extract tags (@tag)
-        Pattern tagPattern = Pattern.compile("\\s@(\\w+)");
-        Matcher tagMatcher = tagPattern.matcher(text);
-
+        Matcher tagMatcher = TAG_PATTERN.matcher(text);
         while (tagMatcher.find()) {
             tags.add(tagMatcher.group(1));
         }
 
         // Remove all tags from the title
-        title = title.replaceAll("\\s@\\w+", "");
+        title = TAG_PATTERN.matcher(title).replaceAll("");
 
         // Extract date markers (#date)
-        Pattern datePattern = Pattern.compile("\\s#(\\w+)");
-        Matcher dateMatcher = datePattern.matcher(text);
+        Matcher dateMatcher = DATE_PATTERN.matcher(text);
         List<String> dates = new ArrayList<>();
-
         while (dateMatcher.find()) {
             dates.add(dateMatcher.group(1));
         }
 
         // Remove all date markers from the title
-        title = title.replaceAll("\\s#(\\w+)", "");
+        title = DATE_PATTERN.matcher(title).replaceAll("");
 
         // Try to parse date references
         if (!dates.isEmpty()) {
@@ -121,41 +134,8 @@ public class TaskTextParser {
                 ) {
                     dueDate = today.plusDays(7);
                     break;
-                } else if (
-                    Arrays.asList(
-                        "monday",
-                        "mon",
-                        "tuesday",
-                        "tue",
-                        "wednesday",
-                        "wed",
-                        "thursday",
-                        "thu",
-                        "friday",
-                        "fri",
-                        "saturday",
-                        "sat",
-                        "sunday",
-                        "sun"
-                    ).contains(lowerDateStr)
-                ) {
-                    Map<String, Integer> dayMap = Map.ofEntries(
-                            Map.entry("monday", DayOfWeek.MONDAY.getValue()),
-                            Map.entry("mon", DayOfWeek.MONDAY.getValue()),
-                            Map.entry("tuesday", DayOfWeek.TUESDAY.getValue()),
-                            Map.entry("tue", DayOfWeek.TUESDAY.getValue()),
-                            Map.entry("wednesday", DayOfWeek.WEDNESDAY.getValue()),
-                            Map.entry("wed", DayOfWeek.WEDNESDAY.getValue()),
-                            Map.entry("thursday", DayOfWeek.THURSDAY.getValue()),
-                            Map.entry("thu", DayOfWeek.THURSDAY.getValue()),
-                            Map.entry("friday", DayOfWeek.FRIDAY.getValue()),
-                            Map.entry("fri", DayOfWeek.FRIDAY.getValue()),
-                            Map.entry("saturday", DayOfWeek.SATURDAY.getValue()),
-                            Map.entry("sat", DayOfWeek.SATURDAY.getValue()),
-                            Map.entry("sunday", DayOfWeek.SUNDAY.getValue()),
-                            Map.entry("sun", DayOfWeek.SUNDAY.getValue())
-                    );
-                    dueDate = getNextWeekday(today, dayMap.get(lowerDateStr));
+                } else if (DAY_MAP.containsKey(lowerDateStr)) {
+                    dueDate = getNextWeekday(today, DAY_MAP.get(lowerDateStr));
                     break;
                 }
 
